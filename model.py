@@ -8,6 +8,20 @@ import torch.nn.functional as F
 
 
 
+class PositionalEncoding(nn.Module):
+    def __init__(self,d_model,image):
+        super(PositionalEncoding,self).__init__()
+        b,c,h,w=image.shape
+        xfreqs=torch.fft.fftfreq(h,dtype=torch.float)
+        yfreqs=torch.fft.fftfreq(w,dtype=torch.float)
+        freqspace=torch.einsum('i,j->ij',xfreqs,yfreqs)
+        self.freqs=freqspace.unsqueeze(0)
+        self.linear=nn.Linear(c,d_model)
+    def forward(self,image):
+        # for now no positional encoding
+        pass
+
+        
 
 
 
@@ -19,20 +33,28 @@ class spectralModel(nn.Module):
         self.num_blocks=num_blocks
         self.blocks=[spectralAuto(in_channels,out_channels) for _ in range(num_blocks)]
         self.final_linear=nn.Linear(out_channels,in_channels).to(torch.cfloat)
+        self.input_linear=nn.Linear(in_channels,out_channels).to(torch.cfloat)
 
-    
         
     def forward(self,x):
-        xft=torch.fft.rfft2(x)
-        for block in self.blocks:
-            xft=block(xft)
         
+        xft=torch.fft.rfft2(x,norm='ortho')
+        xft=xft.permute(0,2,3,1)
+        xft=self.input_linear(xft)
+        xft=xft.permute(0,3,1,2)
+        x=torch.fft.irfft2(xft,norm='ortho')
+        
+        for block in self.blocks:
+            x=block(x)
+        
+        
+        xft=torch.fft.rfft2(x,norm='ortho')
         xft=xft.permute(0,2,3,1)
 
         xft=self.final_linear(xft)  
         xft=xft.permute(0,3,1,2)
         
-        out=torch.fft.irfft2(xft)
+        out=torch.fft.irfft2(xft,norm='ortho')
         return out,xft
         
 
@@ -65,15 +87,17 @@ class feedForward(nn.Module):
     def compl_mul2d(self, input, weights):
         # (batch, in_channel, x,y ), (in_channel, out_channel, x,y) -> (batch, out_channel, x,y)
         return torch.einsum("bixy,io->boxy", input, weights)
-    def forward(self, xft):
+    def forward(self, x):
+        x=x.permute(0,2,3,1)
+        
+        x=self.rms_norm(x)
+        x=x.permute(0,3,1,2)
+        xft=torch.fft.rfft2(x,norm='ortho')
         b,c,hft,wft=xft.shape
-        xft=xft.permute(0,2,3,1)
-        xft=self.rms_norm(xft)
-        xft=xft.permute(0,3,1,2)
         xft=self.compl_mul2d(xft,self.weights1)
-        x=torch.fft.irfft2(xft)
+        x=torch.fft.irfft2(xft,norm='ortho')
         out=F.silu(x)
-        out=torch.fft.rfft2(out)
+        #out=torch.fft.rfft2(out)
         return out
 
 class spectralAuto(nn.Module):
@@ -103,22 +127,20 @@ class spectralAuto(nn.Module):
     def compl_mul(self,input,weights):
         return torch.einsum("bix,io->box", input, weights)
 
-    def forward(self, xft):
+    def forward(self, x):
        # b,c,h,w = x.shape
         # Compute Fourier coeffcients up to factor of e^(- something constant)
         #x_ft = torch.fft.rfft2(x)
 
-        out_ft = \
-            self.compl_mul2d(xft, self.weights1) #linear layer on channel (doesn't mix frequencies)
-        x=torch.fft.irfft2(out_ft)
-        x=F.silu(x)
-
-        xft=torch.fft.rfft2(x)
-        xft=self.transformerBlock(xft)
+        #out_ft = \
+        #    self.compl_mul2d(xft, self.weights1) #linear layer on channel (doesn't mix frequencies)
+        #x=torch.fft.irfft2(out_ft)
+        #x=F.silu(x)
+        xtf=self.transformerBlock(x)
         
-        out=self.feedForward(xft)+xft
+        out=self.feedForward(xtf)+xtf
 
-        #as of right now this is just a single head single block model.
+        
 
         #out=torch.fft.irfft2(out)
         
@@ -161,16 +183,25 @@ class spectralTransformerBlock(nn.Module):
         b, _, h, hw = x.shape
         return x.reshape(b, h * self.num_heads, hw)
 
-    def forward(self, xfft):
+    def forward(self, x):
+       
+        
+        x=x.permute(0,2,3,1)
+        x=self.rms_norm(x)
+        
+        x=x.permute(0,3,1,2)
+        
+        xfft=torch.fft.rfft2(x,norm='ortho')
         b, c, hft, wft = xfft.shape
         hw = hft * wft
 
-        # Normalize and reshape
-        xfft=xfft.permute(0,2,3,1)
-        out_ft = self.rms_norm(xfft)
-        xfft=xfft.permute(0,3,1,2)
-        out_ft=out_ft.permute(0,3,1,2)
-        freqs = out_ft.reshape(b, c, hw)
+        ##need to normalize xfft
+
+        
+        
+        
+        
+        freqs = xfft.reshape(b, c, hw)
 
         # Compute Q, K, V
         q = torch.einsum("bix,io->box", freqs, self.weights_q)
@@ -182,21 +213,26 @@ class spectralTransformerBlock(nn.Module):
         q = self.split_heads(q)
         k = self.split_heads(k)
         v = self.split_heads(v)
-
+        
         # Compute attention scores
-        s = torch.einsum("bnix,bniy->bnxy", q, k) * self.scale
-
+        s = torch.einsum("bnix,bniy->bnxy", q, k.conj()) * self.scale
+        
         # Apply causal mask
         causal_mask = self.generate_causal_mask(hw).to(s.device)
         
-        s = s.masked_fill(causal_mask, float('-inf'))
-
+        
+        
+        
         # Apply softmax
         s = self.softmax(s)
+        
+        s = s.masked_fill(causal_mask, 0)
+
+        
 
         # Apply attention to values
         out = torch.einsum("bnxy,bniy->bnix", s, v)
-
+        
         # Combine heads
         out = self.combine_heads(out)
 
@@ -206,11 +242,13 @@ class spectralTransformerBlock(nn.Module):
         # Reshape and add residual connection
         out = out.reshape(b, c, hft, wft) + xfft
 
+        out=torch.fft.irfft2(out,norm='ortho')
+
         return out
 
 
-model=spectralModel(16,16,4)
+model=spectralModel(16,16,1)
 
 x=torch.randn(2,16,16,16)
 out=model(x)
-print(out[0].shape)
+print(out[0])
