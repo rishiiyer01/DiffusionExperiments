@@ -171,6 +171,7 @@ class spectralTransformerBlock(nn.Module):
 
         self.softmax = nn.Softmax(dim=1)
         self.rms_norm = nn.RMSNorm([in_channels])
+        self.dropout = nn.Dropout(0.1)
 
     def generate_causal_mask(self, size):
         mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
@@ -204,6 +205,7 @@ class spectralTransformerBlock(nn.Module):
         
         
         freqs = xfft.reshape(b, c, hw)
+        freqs=freqs+0.1*torch.randn_like(freqs)
         #freqs+=pos_enc #adding positional encoding
         # Compute Q, K, V
         q = torch.einsum("bix,io->box", freqs, self.weights_q)
@@ -234,7 +236,7 @@ class spectralTransformerBlock(nn.Module):
         
         s = s.masked_fill(causal_mask, 0).to(torch.cfloat)
 
-        
+
 
         # Apply attention to values
         out = torch.einsum("bnxy,bniy->bnix", s, v)
@@ -249,8 +251,7 @@ class spectralTransformerBlock(nn.Module):
         out = out.reshape(b, c, hft, wft) + xfft
 
         out=torch.fft.irfft2(out,norm='ortho')
-
+        out=self.dropout(out)
         return out
 
-model=spectralModel(16,16,1)
 
