@@ -151,7 +151,7 @@ for epoch in range(num_epochs):
         noise = torch.randn_like(images).to(device)
         
         # Forward pass
-        output = model(noise)[1]
+        output = model(images)[1]
         
         # Compute loss
         loss = loss_fn(output, targets)
