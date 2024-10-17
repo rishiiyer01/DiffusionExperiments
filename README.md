@@ -1,2 +1,2 @@
 # DiffusionExperiments
-Experimenting with alternative architectures for image generation. Particularly playing with ideas such as explicit spectral autoregression
+Experimenting with alternative architectures for image generation. Model.py is currently a transformer architecture in the frequency domain, via a 2d fft. We then train with a causal mask to support single forward pass batched loss across the entire sequence. If this does not work, we will likely patch the frequency domain and autoregress on patches. As of right now we start our testing on the simplest of cases -unconditional cifar10 image generation.
