@@ -262,3 +262,9 @@ class spectralTransformerBlock(nn.Module):
         out=torch.fft.irfft2(out,norm='ortho')
         out=self.dropout(out)
         return out
+
+
+model=spectralModel(16,16,1)
+x=torch.randn(2,16,4,4)
+out=model(x)
+print(out.shape)
