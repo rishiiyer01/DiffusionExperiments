@@ -43,13 +43,17 @@ class spectralModel(nn.Module):
         self.out_channels=out_channels
         self.num_blocks=num_blocks
         self.blocks=[spectralAuto(out_channels,out_channels) for _ in range(num_blocks)]
-        self.abs_linear=nn.Linear(out_channels,3*64,dtype=torch.float)
+        self.abs_linear=nn.Linear(out_channels,3*256,dtype=torch.float,bias=True)
         
-        self.phase_linear=nn.Linear(out_channels,3*64,dtype=torch.float) #64 is the finite scalar quantization vocab size
+        self.phase_linear=nn.Linear(out_channels,3*256,dtype=torch.float,bias=True) #256 is the finite scalar quantization vocab size
         
-        self.input_linear=nn.Linear(in_channels,out_channels,dtype=torch.cfloat)
+        self.input_linear=nn.Linear(in_channels,out_channels,dtype=torch.cfloat,bias=True)
         self.softmax = nn.Softmax(dim=-1)
+        
+        self.dc_linear=nn.Linear(1,out_channels,dtype=torch.cfloat,bias=True)
 
+
+        
     def create_index_maps(self,height, width):
         indices = []
         flat_indices = []
@@ -74,21 +78,55 @@ class spectralModel(nn.Module):
         indices = indices.to(device)
         flat_indices = flat_indices.to(device)
         
-        flattened = torch.zeros(batch, vocab,channel, height * width, device=device).to(torch.float)
+        flattened = torch.zeros(batch, vocab,channel, height * width, device=device).to(tensor.dtype)
         flattened[:, :,:, flat_indices] = tensor[:, :,:, indices[:, 0], indices[:, 1]]
         
         
         return flattened
 
-    
+    def custom_unflatten(self,flattened, height, width):
+        batch, channel, _ = flattened.shape
+        device = flattened.device
+        
+        indices, flat_indices = self.create_index_maps(height, width)
+        indices = indices.to(device)
+        flat_indices = flat_indices.to(device)
+        
+        unflattened = torch.zeros(batch, channel, height, width, device=device).to(flattened.dtype)
+        unflattened[:, :, indices[:, 0], indices[:, 1]] = flattened[:, :, flat_indices]
+        
+        return unflattened
 
         
     def forward(self,x):
+
+        b, c, h, w = x.shape
+        #we randomly sample the first frequency from an imaginary gaussian
+        first_freq=torch.randn(b,1,1,dtype=torch.cfloat).to('cuda')
+        first_freq=self.dc_linear(first_freq)
+        first_freq=first_freq.permute(0,2,1)
+        
+        
         
         xft=torch.fft.rfft2(x,norm='ortho')
+        b1,c1,h1,w1=xft.shape
         xft=xft.permute(0,2,3,1)
         xft=self.input_linear(xft)
         xft=xft.permute(0,3,1,2)
+        xft=xft.unsqueeze(dim=1)
+        xft=self.custom_flatten(xft)
+        xft=xft.squeeze(dim=1)
+        xft=torch.cat((first_freq,xft[:,:,:-1]),dim=-1)
+        xft=self.custom_unflatten(xft,h1,w1)
+        
+        #concat first freq to everything else
+        
+
+
+        
+
+
+        
         
         x=torch.fft.irfft2(xft,norm='ortho')
         x=F.silu(x)
@@ -97,7 +135,7 @@ class spectralModel(nn.Module):
             x=block(x)
             #print(torch.linalg.norm(x[0,0,:,:]))
             
-            
+        #print(torch.linalg.norm(x))   
         
         
         xft=torch.fft.rfft2(x,norm='ortho')
@@ -107,8 +145,8 @@ class spectralModel(nn.Module):
         xft_abs=self.abs_linear(torch.abs(xft)) #b,h,w,c=70*3
         xft_phase=self.phase_linear(torch.abs(xft)) #b,h,w,c=100*3
         
-        xft_r_phase, xft_g_phase, xft_b_phase = torch.split(xft_phase, 64, dim=-1)  
-        xft_r_abs, xft_g_abs, xft_b_abs = torch.split(xft_abs, 64, dim=-1)   
+        xft_r_phase, xft_g_phase, xft_b_phase = torch.split(xft_phase, 256, dim=-1)  
+        xft_r_abs, xft_g_abs, xft_b_abs = torch.split(xft_abs, 256, dim=-1)   
         xft_phase=torch.stack((xft_r_phase, xft_g_phase, xft_b_phase),dim=-1) #b,h,w,c=3,vocab_size
         xft_abs=torch.stack((xft_r_abs, xft_g_abs, xft_b_abs),dim=-1) #b,h,w,c,vocab
         #xft_abs=self.softmax(xft_abs)
@@ -119,6 +157,7 @@ class spectralModel(nn.Module):
         #out=torch.fft.irfft2(xft,norm='ortho') #b,vocab,c,x,y
         xftflat_phase=self.custom_flatten(xft_phase) #b,vocab,c,x*y
         xftflat_abs=self.custom_flatten(xft_abs)
+        print(xftflat_phase.shape)
         return xftflat_abs,xftflat_phase
         
 
@@ -161,9 +200,9 @@ class feedForward(nn.Module):
         b,c,hft,wft=xft.shape
         xft=self.compl_mul2d(xft,self.weights1)
         x=torch.fft.irfft2(xft,norm='ortho')
-        out=F.normalize(x)
-        out=F.silu(out)
-        
+        #out=F.normalize(x)
+        out=F.silu(x)
+        #print(torch.linalg.norm(out))
         #out=torch.fft.rfft2(out)
         return out
 
@@ -182,7 +221,7 @@ class spectralAuto(nn.Module):
         self.scale = (1 / (in_channels * out_channels))
         
         self.feedForward=feedForward(out_channels, out_channels)
-        self.transformerBlock=spectralTransformerBlock(out_channels, out_channels,num_heads=8)
+        self.transformerBlock=spectralTransformerBlock(out_channels, out_channels,num_heads=16)
     # Complex multiplication
     def compl_mul2d(self, input, weights):
         # (batch, in_channel, x,y ), (in_channel, out_channel, x,y) -> (batch, out_channel, x,y)
@@ -211,7 +250,7 @@ class spectralAuto(nn.Module):
         return out
 
 class spectralTransformerBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, num_heads=8,device='cuda'):
+    def __init__(self, in_channels, out_channels, num_heads=12,device='cuda'):
         super(spectralTransformerBlock, self).__init__()
 
         self.in_channels = in_channels
@@ -365,8 +404,8 @@ class spectralTransformerBlock(nn.Module):
         out= self.custom_unflatten(out,hft,wft) +xfft
 
         out=torch.fft.irfft2(out,norm='ortho')
-        out=F.normalize(out)
-        #out=self.dropout(out)
+        #out=F.normalize(out)
+        out=self.dropout(out)
         return out
 
 #model=spectralModel(16,16,1).to('cuda')
