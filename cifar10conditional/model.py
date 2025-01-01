@@ -1,414 +1,353 @@
-## going to create a spectral diffusion model
-# the point of this is to experiment with alternative diffusion model architectures
-#including explicit frequency autoregression
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from math import inf
+import math
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self,d_model):
-        super(PositionalEncoding,self).__init__()
-        
-        self.linear=nn.Linear(2,d_model,bias=True).to(torch.float) #bias for translation
-    def forward(self,image):
-        b,c,h,w=image.shape
-        xfreqs=torch.fft.fftfreq(h,dtype=torch.float)
-        yfreqs=torch.fft.rfftfreq(w,dtype=torch.float)
-        xfreqgrid,yfreqgrid=torch.meshgrid(xfreqs,yfreqs, indexing='ij') #full spectrum,real spectrum
-        xfreqgrid=xfreqgrid.expand(b,-1,-1).unsqueeze(1)
-        yfreqgrid=yfreqgrid.expand(b,-1,-1).unsqueeze(1)
-        freqgrid=torch.cat((xfreqgrid,yfreqgrid),dim=1)
-        freqgrid=freqgrid.permute(0,2,3,1)
-        freqgrid=self.linear(freqgrid)
-        freqgrid=freqgrid.permute(0,3,1,2)
-        
-        x=F.normalize(freqgrid,dim=1)
-        x=x.to(torch.cfloat).to('cuda')
-        
-        #print(x.shape, 'pos_enc') 
-        
-        return x
-
-        
-
-
-
-class spectralModel(nn.Module):
-    def __init__(self,in_channels,out_channels,num_blocks):
-        super(spectralModel,self).__init__()
-        self.in_channels=in_channels
-        self.out_channels=out_channels
-        self.num_blocks=num_blocks
-        self.blocks=[spectralAuto(out_channels,out_channels) for _ in range(num_blocks)]
-        self.abs_linear=nn.Linear(out_channels,3*256,dtype=torch.float,bias=True)
-        
-        self.phase_linear=nn.Linear(out_channels,3*256,dtype=torch.float,bias=True) #256 is the finite scalar quantization vocab size
-        
-        self.input_linear=nn.Linear(in_channels,out_channels,dtype=torch.cfloat,bias=True)
-        self.softmax = nn.Softmax(dim=-1)
-        
-        self.dc_linear=nn.Linear(1,out_channels,dtype=torch.cfloat,bias=True)
+def create_index_maps_fftshift(height, width):
+    """
+    Creates index mappings for fft-shifted data starting from center-left.
+    Returns both flattening and unflattening indices.
+    """
+    indices = []
+    flat_indices = []
+    index = 0
+    
+    # Find center row
+    center_h = height // 2
+    
+    # Start from center row, then alternate up and down
+    row_order = [center_h]
+    for i in range(1, height):
+        if center_h + i < height:
+            row_order.append(center_h + i)
+        if center_h - i >= 0:
+            row_order.append(center_h - i)
+    
+    # Process each row from left to right
+    for h in row_order:
+        for w in range(width):
+            indices.append((h, w))
+            flat_indices.append(index)
+            index += 1
+    
+    indices = torch.tensor(indices)
+    flat_indices = torch.tensor(flat_indices)
+    
+    # Create inverse mapping for unflattening
+    unflatten_indices = torch.zeros_like(flat_indices)
+    unflatten_indices[flat_indices] = torch.arange(len(flat_indices))
+    
+    return indices, flat_indices, unflatten_indices
 
 
-        
-    def create_index_maps(self,height, width):
-        indices = []
-        flat_indices = []
-        index = 0
-        for sum_indices in range(height + width - 1):
-            for i in range(min(sum_indices + 1, height)):
-                j = sum_indices - i
-                if j < width:
-                    indices.append((i, j))
-                    flat_indices.append(index)
-                    index += 1
-        
-        indices = torch.tensor(indices)
-        flat_indices = torch.tensor(flat_indices)
-        return indices, flat_indices
-        
-    def custom_flatten(self,tensor):
-        batch, vocab,channel, height, width = tensor.shape
-        device = tensor.device
-        
-        indices, flat_indices = self.create_index_maps(height, width)
-        indices = indices.to(device)
-        flat_indices = flat_indices.to(device)
-        
-        flattened = torch.zeros(batch, vocab,channel, height * width, device=device).to(tensor.dtype)
-        flattened[:, :,:, flat_indices] = tensor[:, :,:, indices[:, 0], indices[:, 1]]
-        
-        
-        return flattened
 
-    def custom_unflatten(self,flattened, height, width):
-        batch, channel, _ = flattened.shape
-        device = flattened.device
+class RotaryPositionEmbedding(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int = 4096):
+        """
+        Initialize Rotary Position Embedding
         
-        indices, flat_indices = self.create_index_maps(height, width)
-        indices = indices.to(device)
-        flat_indices = flat_indices.to(device)
+        Args:
+            dim: Dimension of the embedding (must be divisible by 2)
+            max_seq_len: Maximum sequence length
+        """
+        super().__init__()
         
-        unflattened = torch.zeros(batch, channel, height, width, device=device).to(flattened.dtype)
-        unflattened[:, :, indices[:, 0], indices[:, 1]] = flattened[:, :, flat_indices]
-        
-        return unflattened
-
-        
-    def forward(self,x):
-
-        b, c, h, w = x.shape
-        #we randomly sample the first frequency from an imaginary gaussian
-        first_freq=torch.randn(b,1,1,dtype=torch.cfloat).to('cuda')
-        first_freq=self.dc_linear(first_freq)
-        first_freq=first_freq.permute(0,2,1)
-        
-        
-        
-        xft=torch.fft.rfft2(x,norm='ortho')
-        b1,c1,h1,w1=xft.shape
-        xft=xft.permute(0,2,3,1)
-        xft=self.input_linear(xft)
-        xft=xft.permute(0,3,1,2)
-        xft=xft.unsqueeze(dim=1)
-        xft=self.custom_flatten(xft)
-        xft=xft.squeeze(dim=1)
-        xft=torch.cat((first_freq,xft[:,:,:-1]),dim=-1)
-        xft=self.custom_unflatten(xft,h1,w1)
-        
-        #concat first freq to everything else
-        
-
-
-        
-
-
-        
-        
-        x=torch.fft.irfft2(xft,norm='ortho')
-        x=F.silu(x)
-        
-        for block in self.blocks:
-            x=block(x)
-            #print(torch.linalg.norm(x[0,0,:,:]))
+        if dim % 2 != 0:
+            raise ValueError("Dimension must be divisible by 2")
             
-        #print(torch.linalg.norm(x))   
+        self.dim = dim
+        self.max_seq_len = max_seq_len
         
+        # Create position indices tensor
+        position = torch.arange(max_seq_len).unsqueeze(1)  # [max_seq_len, 1]
         
-        xft=torch.fft.rfft2(x,norm='ortho')
-        xft=xft.permute(0,2,3,1)
-        #print(xft,'xft')
+        # Create dimension indices tensor for half the dimension
+        # Since we'll rotate half the dimensions, we only need dim/2
+        div_term = torch.exp(
+            torch.arange(0, dim//2) * -(math.log(10000.0) / (dim//2))
+        )
         
-        xft_abs=self.abs_linear(torch.abs(xft)) #b,h,w,c=70*3
-        xft_phase=self.phase_linear(torch.abs(xft)) #b,h,w,c=100*3
+        # Compute sin and cos tables for half dimensions
+        emb = position * div_term
+        self.register_buffer("sin_table", emb.sin().unsqueeze(0))  # [1, max_seq_len, dim//2]
+        self.register_buffer("cos_table", emb.cos().unsqueeze(0))  # [1, max_seq_len, dim//2]
         
-        xft_r_phase, xft_g_phase, xft_b_phase = torch.split(xft_phase, 256, dim=-1)  
-        xft_r_abs, xft_g_abs, xft_b_abs = torch.split(xft_abs, 256, dim=-1)   
-        xft_phase=torch.stack((xft_r_phase, xft_g_phase, xft_b_phase),dim=-1) #b,h,w,c=3,vocab_size
-        xft_abs=torch.stack((xft_r_abs, xft_g_abs, xft_b_abs),dim=-1) #b,h,w,c,vocab
-        #xft_abs=self.softmax(xft_abs)
-        #xft_phase=self.softmax(xft_phase)
-        
-        xft_abs=xft_abs.permute(0,4,3,1,2) #b,vocab,c,h,w
-        xft_phase=xft_phase.permute(0,4,3,1,2) #b,vocab,c,h,w
-        #out=torch.fft.irfft2(xft,norm='ortho') #b,vocab,c,x,y
-        xftflat_phase=self.custom_flatten(xft_phase) #b,vocab,c,x*y
-        xftflat_abs=self.custom_flatten(xft_abs)
-        print(xftflat_phase.shape)
-        return xftflat_abs,xftflat_phase
-        
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotate half the hidden dims of the input."""
+        x1 = x[..., :x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
 
-
-
-
-
-
-
-
-class ComplexSoftmax(nn.Module):
-    def __init__(self, use_phase=True):
-        super(ComplexSoftmax,self).__init__()
-        # act can be either a function from nn.functional or a nn.Module if the
-        # activation has learnable parameters
-        self.act = nn.Softmax(dim=1)
-        self.use_phase = use_phase
-
-    def forward(self, z):
-        if self.use_phase:
-            return self.act(torch.abs(z)) * torch.exp(1.j * torch.angle(z)) 
-        else:
-            return self.act(z.real) + 1.j * self.act(z.imag)
-
-class feedForward(nn.Module):
-    def __init__(self, in_channels, out_channels,device='cuda'):
-        super(feedForward, self).__init__()
-        self.weights1=nn.Parameter(torch.rand(in_channels, out_channels, dtype=torch.cfloat)).to(device)
-        self.rms_norm = nn.RMSNorm([in_channels]).to(device)
-    def compl_mul2d(self, input, weights):
-        # (batch, in_channel, x,y ), (in_channel, out_channel, x,y) -> (batch, out_channel, x,y)
-        return torch.einsum("bixy,io->boxy", input, weights)
-    def forward(self, x):
-        #x=x.permute(0,2,3,1)
-        #x=x/(torch.linalg.norm(x,dim=-1).unsqueeze(-1))
-        #x=self.rms_norm(x)
-        #x=x.permute(0,3,1,2)
-        x=F.normalize(x)
-        xft=torch.fft.rfft2(x,norm='ortho')
-        b,c,hft,wft=xft.shape
-        xft=self.compl_mul2d(xft,self.weights1)
-        x=torch.fft.irfft2(xft,norm='ortho')
-        #out=F.normalize(x)
-        out=F.silu(x)
-        #print(torch.linalg.norm(out))
-        #out=torch.fft.rfft2(out)
-        return out
-
-class spectralAuto(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(spectralAuto, self).__init__()
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        2D Fourier layer. It does FFT, linear transform for QKV, spectral attention, and Inverse FFT.    
+        Apply rotary position embedding to input tensor
+        
+        Args:
+            x: Input tensor of shape [batch_size, num_heads, seq_len, head_dim]
+            
+        Returns:
+            Tensor with positional information encoded
         """
-        #self.attention=nn.MultiheadAttention(in_channels, num_heads=8, batch_first=True,bias=False)
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        batch_size, num_heads, seq_len, dim = x.shape
         
-
-        self.scale = (1 / (in_channels * out_channels))
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"Sequence length {seq_len} exceeds maximum length {self.max_seq_len}")
+            
+        # Get sin and cos values for current sequence length
+        sin = self.sin_table[:, :seq_len, :]  # [1, seq_len, dim//2]
+        cos = self.cos_table[:, :seq_len, :]  # [1, seq_len, dim//2]
         
-        self.feedForward=feedForward(out_channels, out_channels)
-        self.transformerBlock=spectralTransformerBlock(out_channels, out_channels,num_heads=16)
-    # Complex multiplication
-    def compl_mul2d(self, input, weights):
-        # (batch, in_channel, x,y ), (in_channel, out_channel, x,y) -> (batch, out_channel, x,y)
-        return torch.einsum("bixy,io->boxy", input, weights)
+        # Duplicate the sin/cos for the full dimension
+        sin = torch.cat([sin, sin], dim=-1)  # [1, seq_len, dim]
+        cos = torch.cat([cos, cos], dim=-1)  # [1, seq_len, dim]
+        
+        # Reshape sin and cos for broadcasting
+        sin = sin.unsqueeze(1)  # [1, 1, seq_len, dim]
+        cos = cos.unsqueeze(1)  # [1, 1, seq_len, dim]
+        
+        # Expand to match input shape
+        sin = sin.expand(batch_size, num_heads, -1, -1)
+        cos = cos.expand(batch_size, num_heads, -1, -1)
+        
+        # Apply rotation using complex number multiplication:
+        # (a + ib)(cos θ + i sin θ) = (a cos θ - b sin θ) + i(a sin θ + b cos θ)
+        return (x * cos) + (self._rotate_half(x) * sin)
     
-    def compl_mul(self,input,weights):
-        return torch.einsum("bix,io->box", input, weights)
 
-    def forward(self, x):
-       # b,c,h,w = x.shape
-        # Compute Fourier coeffcients up to factor of e^(- something constant)
-        #x_ft = torch.fft.rfft2(x)
-
-        #out_ft = \
-        #    self.compl_mul2d(xft, self.weights1) #linear layer on channel (doesn't mix frequencies)
-        #x=torch.fft.irfft2(out_ft)
-        #x=F.silu(x)
-        xtf=self.transformerBlock(x)
+class SpectralProcessingModel(nn.Module):
+    def __init__(self, in_channels, hidden_dim, num_blocks):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_blocks = num_blocks
         
-        out=self.feedForward(xtf)+xtf
-
+        # Initial processing
+        self.initial_proj = nn.Linear(in_channels * 2, hidden_dim,bias=True)  # *2 for magnitude and phase
         
-
-        #out=torch.fft.irfft2(out)
+        # Main processing blocks
+        self.blocks = nn.ModuleList([
+            SpectralBlock(hidden_dim) for _ in range(num_blocks)
+        ])
         
-        return out
-
-class spectralTransformerBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, num_heads=12,device='cuda'):
-        super(spectralTransformerBlock, self).__init__()
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.num_heads = num_heads
-        self.head_dim = out_channels // num_heads
-
-        assert self.head_dim * num_heads == out_channels, "out_channels must be divisible by num_heads"
-
-        self.scale = 1 / (self.head_dim)
-
-        # Weights for Q, K, V
-        self.weights_q = nn.Parameter(torch.rand(in_channels, out_channels, dtype=torch.cfloat)).to(device)
-        self.weights_k = nn.Parameter(torch.rand(in_channels, out_channels, dtype=torch.cfloat)).to(device)
-        self.weights_v = nn.Parameter(torch.rand(in_channels, out_channels, dtype=torch.cfloat)).to(device)
-        self.pos_encoding=PositionalEncoding(out_channels)
-        # Output projection
-        self.weights_o = nn.Parameter(torch.rand(out_channels, out_channels, dtype=torch.cfloat)).to(device)
-
-        self.softmax = nn.Softmax(dim=-1)
-        self.rms_norm = nn.RMSNorm([in_channels]).to(device)
-        self.dropout = nn.Dropout(0.1)
-
-    def generate_causal_mask(self, size):
-        mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
+        # Output projections for magnitude and phase
+        self.mag_proj = nn.Linear(hidden_dim//2, 1024*3,bias=True)  # 1024, used to be 256 classes for magnitude
+        self.phase_proj = nn.Linear(hidden_dim//2, 1024*3,bias=True)  # 1024, used to be 256 classes for phase
+        self.dc_linear=nn.Linear(1,hidden_dim,bias=True)
+        self.start_token = nn.Parameter(torch.randn(1, 1, 1))
         
-        return mask
-
-    def split_heads(self, x):
-        b, c, hw = x.shape
-        return x.view(b, self.num_heads, self.head_dim, hw)
-    
-    def combine_heads(self, x):
-        b, _, h, hw = x.shape
-        return x.reshape(b, h * self.num_heads, hw)
         
-    def create_index_maps(self,height, width):
-        indices = []
-        flat_indices = []
-        index = 0
-        for sum_indices in range(height + width - 1):
-            for i in range(min(sum_indices + 1, height)):
-                j = sum_indices - i
-                if j < width:
-                    indices.append((i, j))
-                    flat_indices.append(index)
-                    index += 1
-        
-        indices = torch.tensor(indices)
-        flat_indices = torch.tensor(flat_indices)
-        return indices, flat_indices
-    
-    def custom_flatten(self,tensor):
+    def custom_flatten(self, tensor):
+        """
+        Flattens fft-shifted tensor starting from center frequencies
+        """
         batch, channel, height, width = tensor.shape
         device = tensor.device
         
-        indices, flat_indices = self.create_index_maps(height, width)
+        indices, flat_indices, _ = create_index_maps_fftshift(height, width)
         indices = indices.to(device)
         flat_indices = flat_indices.to(device)
         
-        flattened = torch.zeros(batch, channel, height * width, device=device).to(torch.cfloat)
+        flattened = torch.zeros(batch, channel, height * width, device=device).to(tensor.dtype)
         flattened[:, :, flat_indices] = tensor[:, :, indices[:, 0], indices[:, 1]]
         
         return flattened
     
-    def custom_unflatten(self,flattened, height, width):
-        batch, channel, _ = flattened.shape
-        device = flattened.device
+    def custom_unflatten(self, tensor, height, width):
+        """
+        Unflattens tensor back to original fft-shifted shape
+        """
+        batch, channel, seq_len = tensor.shape
+        device = tensor.device
         
-        indices, flat_indices = self.create_index_maps(height, width)
+        indices, _, unflatten_indices = create_index_maps_fftshift(height, width)
         indices = indices.to(device)
-        flat_indices = flat_indices.to(device)
+        unflatten_indices = unflatten_indices.to(device)
         
-        unflattened = torch.zeros(batch, channel, height, width, device=device).to(torch.cfloat)
-        unflattened[:, :, indices[:, 0], indices[:, 1]] = flattened[:, :, flat_indices]
+        unflattened = torch.zeros(batch, channel, height, width, device=device).to(tensor.dtype)
+        unflattened[:, :, indices[:, 0], indices[:, 1]] = tensor[:, :, unflatten_indices]
         
         return unflattened
 
+
+        
+    def forward(self, x,condition):
+
+        # Initial FFT
+        x_ft = torch.fft.rfft2(x, norm='ortho')
+        x_ft=torch.fft.fftshift(x_ft,dim=2)
+        # Convert to magnitude and phase, this isn't actually magnitude and phase I just didn't change the code yet
+        magnitude = torch.real(x_ft)
+         
+        
+        #magnitude=torch.abs(x_ft)
+        phase = torch.imag(x_ft)
+        
+        
+        # Flatten and concatenate
+        b, c, h, w = magnitude.shape
+        phase=self.custom_flatten(phase)
+
+        magnitude=self.custom_flatten(magnitude) #returns shape of b,c,h*w
+        
+        x = torch.stack([magnitude, phase], dim=1) #returns shape of b,2,c,h*w
+        x=x.permute(0,3,1,2)
+        x=x.reshape(b,h*w,c*2) #reshape is invertible so we can recover channel, then we can recover abs, phase
+        
+        
+        # Initial projection
+        x = self.initial_proj(x)
+        #we randomly sample the first frequency from a gaussian
+        #we could alternatively sample from an imaginary gaussian
+        #first_freq=torch.randn(b,1,1,dtype=torch.float).to('cuda')
+        #the condition is the start token
+        condition=condition.unsqueeze(1).unsqueeze(1)
+        first_freq=self.dc_linear(condition) #b,1,hidden_dim
+        #cat dc freq to image
+        x=torch.cat((first_freq,x[:,:-1,:]),dim=1)
+        
+         #b,h*w,hidden
+        
+        #x=x.permute(0,2,1)
+
+        #step 1 complete
+
+        
+        # Apply blocks
+        for block in self.blocks:
+            x = block(x)
+
+        x=x.reshape(b,h*w,2,-1)
+        # Project to classes
+        mag_logits = self.mag_proj(x)[:,:,0,:]
+        phase_logits = self.phase_proj(x)[:,:,1,:] #shape of b,h*w,256*3
+        
+        # Reshape to match your current output format
+        mag_logits = mag_logits.view(b, h*w, 1024, c).permute(0,3,2,1)
+        phase_logits = phase_logits.view(b, h*w, 1024, c).permute(0,3,2,1) #vocab size used to be 256
+        
+        
+        return mag_logits, phase_logits
+
+
+
+
+#step 2 check
+class SpectralBlock(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attention =SpectralAttention(hidden_dim)
+        self.ff = FeedForward(hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        
     def forward(self, x):
-       
-        
-        #x=x.permute(0,2,3,1)
-        
-        #x=self.rms_norm(x)
-        
-        #x=x/(torch.linalg.norm(x,dim=-1).unsqueeze(-1))
-        
-        #x=x.permute(0,3,1,2)
-        x=F.normalize(x)
-        pos_enc=self.pos_encoding(x)
-        xfft=torch.fft.rfft2(x,norm='ortho')
-        #print(torch.linalg.norm(xfft))
-        b, c, hft, wft = xfft.shape
-        hw = hft * wft
+        x = x + self.attention(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
+        return x
 
-        ##need to normalize xfft
 
         
-        #print(xfft.shape)
-        xfft+=pos_enc #adding positional encoding
+#checked and is correct
+class FeedForward(nn.Module):
+    def __init__(self, hidden_dim, expansion_factor=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * expansion_factor),
+            nn.GELU(),
+            nn.Linear(hidden_dim * expansion_factor, hidden_dim)
+        )
         
-        #freqs = xfft.reshape(b, c, hw)
-        freqs=self.custom_flatten(xfft)
-        
-        
-        
-        # Compute Q, K, V
-        q = F.normalize(torch.einsum("bix,io->box", freqs, self.weights_q))
-        k = F.normalize(torch.einsum("bix,io->box", freqs, self.weights_k))
-        v = F.normalize(torch.einsum("bix,io->box", freqs, self.weights_v))
-        
+    def forward(self, x):
+        return self.net(x)
 
-        # Split heads
-        q = self.split_heads(q)
-        k = self.split_heads(k)
-        v = self.split_heads(v)
+#classic style attention
+class SpectralAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
         
-        # Compute attention scores
-        s = torch.einsum("bnix,bniy->bnxy", q.conj(), k) * self.scale 
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.rope=RotaryPositionEmbedding(self.head_dim)
+        self.scale = self.head_dim ** -0.5
         
-        # it should be noted here that the scores here are complex valued, to associate them with real probabilities we take the square of the absolute value or softmax the absolute value
+    def forward(self, x):
+        B, N,dim = x.shape
         
-        s=torch.abs(s)
+        # QKV projection
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        #print(q.shape)
+        q=q+self.rope(q)
+        k=k+self.rope(k)
         
+        # Attention
+        attn = (q @ k.transpose(-2, -1)) * self.scale
         
-        # Apply causal mask
-        causal_mask = self.generate_causal_mask(hw).to(s.device)
+        # Create causal mask
+        causal_mask = torch.triu(torch.ones(N, N), diagonal=1).bool()
+        attn = attn.masked_fill(causal_mask.to(attn.device), float('-inf'))
         
+        attn = F.softmax(attn, dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
         
-        s = s.masked_fill(causal_mask, -inf)
-        
-        # Apply softmax
-        s = self.softmax(s).to(torch.cfloat)
-        
-        
-        
+        # Output projection
+        x = self.proj(x)
+        return x
 
+
+
+
+
+#best version does not use this
+
+class ComplexAttention(nn.Module):
+    def __init__(self,hidden_dim,num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
         
+        self.qkv = nn.Linear(hidden_dim//2, hidden_dim * 3,dtype=torch.cfloat)
+        self.proj = nn.Linear(hidden_dim*2, hidden_dim)
+        self.rope=RotaryPositionEmbedding(self.head_dim)
+        self.scale = self.head_dim ** -0.5
 
-        # Apply attention to values
-        out = torch.einsum("bnxy,bniy->bnix", s, v)
+
+    def forward(self, x):
+        B, N,dim = x.shape
+        x=x.reshape(B,N,2,-1)
+        mags=x[:,:,0,:]
+        phases=x[:,:,1,:] #b,h*w,hidden_dim/2
+        x=mags*torch.exp(1j*phases)
+        # QKV projection
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # Combine heads
-        out = self.combine_heads(out)
-
-        # Apply output projection
-        out = torch.einsum("bix,io->box", out, self.weights_o)
+        #print(q.shape)
+        q=q+self.rope(torch.abs(q)).to(torch.cfloat)
+        k=k+self.rope(torch.abs(k))
         
-        # Reshape and add residual connection
-        #out = out.reshape(b, c, hft, wft) + xfft
-        out= self.custom_unflatten(out,hft,wft) +xfft
-
-        out=torch.fft.irfft2(out,norm='ortho')
-        #out=F.normalize(out)
-        out=self.dropout(out)
-        return out
-
-#model=spectralModel(16,16,1).to('cuda')
-#x=torch.randn(2,16,4,4).to('cuda')
+        # Attention
+        attn = torch.abs((q.conj() @ k.transpose(-2, -1)) * self.scale)
+        
+        # Create causal mask
+        causal_mask = torch.triu(torch.ones(N, N), diagonal=1).bool()
+        attn = attn.masked_fill(causal_mask.to(attn.device), float('-inf'))
+        
+        attn = F.softmax(attn, dim=-1).to(torch.cfloat)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+        
+        x=torch.cat((torch.abs(x),torch.angle(x)),dim=-1)
+        # Output projection
+        x = self.proj(x)
+        return x
+#model=SpectralProcessingModel(3,16,8).to('cuda')
+#model=ComplexAttention(16)
+#x=torch.randn(2,16,16)
+#x=torch.randn(2,3,16,16).to('cuda')
 #out=model(x)
-#print(out)
+#print(out.shape)
+#print(torch.linalg.norm(out[0]))
